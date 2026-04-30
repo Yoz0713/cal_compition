@@ -46,47 +46,55 @@ export async function POST(request: NextRequest) {
   // Process each pair sequentially to avoid hitting rate limits
   for (const pair of pairs) {
     try {
-      const url = new URL(
-        "https://maps.googleapis.com/maps/api/distancematrix/json",
+      const response = await fetch(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": apiKey,
+            "X-Goog-FieldMask": "routes.distanceMeters",
+          },
+          body: JSON.stringify({
+            origin: { address: `大樹藥局${pair.center}` },
+            destination: { address: `大樹藥局${pair.pharmacy}` },
+            travelMode: "DRIVE",
+            languageCode: "zh-TW",
+          }),
+        },
       );
-      url.searchParams.set("origins", pair.center);
-      url.searchParams.set("destinations", pair.pharmacy);
-      url.searchParams.set("mode", "driving");
-      url.searchParams.set("language", "zh-TW");
-      url.searchParams.set("key", apiKey);
 
-      const response = await fetch(url.toString());
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        const errMsg =
+          (errBody as { error?: { message?: string } }).error?.message ??
+          `HTTP ${response.status}`;
+        results.push({
+          center: pair.center,
+          pharmacy: pair.pharmacy,
+          distanceKm: null,
+          error: `API 錯誤: ${errMsg}`,
+        });
+        continue;
+      }
+
       const data = await response.json();
+      const distanceMeters = data.routes?.[0]?.distanceMeters;
 
-      if (data.status !== "OK") {
+      if (distanceMeters == null) {
         results.push({
           center: pair.center,
           pharmacy: pair.pharmacy,
           distanceKm: null,
-          error: `API 狀態: ${data.status}`,
+          error: "無法計算距離：找不到路線",
         });
         continue;
       }
-
-      const element = data.rows?.[0]?.elements?.[0];
-
-      if (!element || element.status !== "OK") {
-        results.push({
-          center: pair.center,
-          pharmacy: pair.pharmacy,
-          distanceKm: null,
-          error: `無法計算距離: ${element?.status ?? "UNKNOWN"}`,
-        });
-        continue;
-      }
-
-      // distance.value is in meters
-      const distanceKm = element.distance.value / 1000;
 
       results.push({
         center: pair.center,
         pharmacy: pair.pharmacy,
-        distanceKm,
+        distanceKm: distanceMeters / 1000,
       });
     } catch (fetchError) {
       results.push({

@@ -6,6 +6,7 @@ export type ReferralRow = {
   leftEar: number;
   rightEar: number;
   hearingScore: number;
+  region: string;
 };
 
 export type PharmacySummary = {
@@ -17,8 +18,11 @@ export type PharmacySummary = {
   hearingScoreTotal: number;
   avgScore: number;
   region: string;
+  hasRegionConflict: boolean;
   rows: ReferralRow[];
 };
+
+export const VALID_REGIONS = ["桃區", "竹苗區", "宜花區", "中彰投區"] as const;
 
 export type ParsedExcelResult = {
   rows: ReferralRow[];
@@ -51,9 +55,10 @@ export function isExcelFile(file: File): boolean {
   );
 }
 
-export function toNumber(value: unknown): number {
+export function toNumber(value: unknown): { valid: boolean; value: number } {
   const numberValue = Number(value);
-  return Number.isFinite(numberValue) ? numberValue : 0;
+  const valid = value !== "" && value != null && Number.isFinite(numberValue);
+  return { valid, value: valid ? numberValue : 0 };
 }
 
 export async function parseExcel(file: File): Promise<ParsedExcelResult> {
@@ -73,29 +78,34 @@ export async function parseExcel(file: File): Promise<ParsedExcelResult> {
 
     if (!center || !pharmacy) return result;
 
-    const leftEar = toNumber(row[2]);
-    const rightEar = toNumber(row[3]);
-    const isOutOfRange =
-      leftEar < -10 || leftEar > 120 || rightEar < -10 || rightEar > 120;
+    const left = toNumber(row[2]);
+    const right = toNumber(row[3]);
+    const region = String(row[4] ?? "").trim();
 
-    if (isOutOfRange) {
+    const isEarInvalid = !left.valid || !right.valid;
+    const isOutOfRange =
+      left.value < -10 || left.value > 120 || right.value < -10 || right.value > 120;
+    const isRegionInvalid = !(VALID_REGIONS as readonly string[]).includes(region);
+
+    if (isEarInvalid || isOutOfRange || isRegionInvalid) {
       result.invalidRows.push({
         center,
         pharmacy,
-        leftEar,
-        rightEar,
+        leftEar: left.value,
+        rightEar: right.value,
         hearingScore: 0,
+        region,
       });
-
       return result;
     }
 
     result.rows.push({
       center,
       pharmacy,
-      leftEar,
-      rightEar,
-      hearingScore: getHearingScore(leftEar, rightEar),
+      leftEar: left.value,
+      rightEar: right.value,
+      hearingScore: getHearingScore(left.value, right.value),
+      region,
     });
 
     return result;
@@ -109,9 +119,15 @@ export async function getExcelDataRowCount(file: File): Promise<number> {
 
 export function groupByPharmacy(rows: ReferralRow[]): PharmacySummary[] {
   const summaries = new Map<string, PharmacySummary>();
+  const regionSets = new Map<string, Set<string>>();
 
   rows.forEach((row) => {
     const key = normalizeName(row.pharmacy);
+
+    // Track all regions seen for this pharmacy
+    if (!regionSets.has(key)) regionSets.set(key, new Set());
+    regionSets.get(key)!.add(row.region);
+
     const current =
       summaries.get(key) ??
       ({
@@ -122,7 +138,8 @@ export function groupByPharmacy(rows: ReferralRow[]): PharmacySummary[] {
         hearingBonus10Count: 0,
         hearingScoreTotal: 0,
         avgScore: 0,
-        region: "未分類",
+        region: row.region,
+        hasRegionConflict: false,
         rows: [],
       } satisfies PharmacySummary);
 
@@ -142,6 +159,15 @@ export function groupByPharmacy(rows: ReferralRow[]): PharmacySummary[] {
 
     summaries.set(key, current);
   });
+
+  // Mark region conflicts
+  for (const [key, regions] of regionSets) {
+    const summary = summaries.get(key)!;
+    if (regions.size > 1) {
+      summary.hasRegionConflict = true;
+      summary.region = "區域衝突";
+    }
+  }
 
   return Array.from(summaries.values()).sort((a, b) =>
     a.name.localeCompare(b.name, "zh-Hant"),
