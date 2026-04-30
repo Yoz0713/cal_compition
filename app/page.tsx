@@ -3,7 +3,6 @@
 import { ChangeEvent, useMemo, useState } from "react";
 import {
   DistanceResult,
-  getDistanceScore,
   getExcelDataRowCount,
   groupByPharmacy,
   isExcelFile,
@@ -24,12 +23,40 @@ type UploadStats = {
   centerCount: number;
 };
 
-type DistanceApiResult = {
-  center: string;
-  pharmacy: string;
-  distanceKm: number | null;
-  error?: string;
+type DistanceApiResponse = {
+  centerName: string;
+  pharmacyName: string;
+  centerResolvedAddress?: string;
+  pharmacyResolvedAddress?: string;
+  distanceKm?: number;
+  distanceScore: number;
+  isSameStore: boolean;
+  status: "success" | "same_store" | "place_not_found" | "distance_failed";
+  errorMessage?: string;
 };
+
+// Concurrency limiter: run async tasks with max N in parallel
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  maxConcurrency: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex++;
+      results[index] = await tasks[index]();
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(maxConcurrency, tasks.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 const ACTIVE_REGIONS = [...VALID_REGIONS];
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
@@ -193,51 +220,47 @@ export default function Home() {
     setWeightedResults(null);
 
     try {
+      // 1. Collect unique center-pharmacy pairs
       const pairSet = new Map<string, { center: string; pharmacy: string }>();
       for (const row of rows) {
-        const key = `${normalizeName(row.center)}||${normalizeName(row.pharmacy)}`;
+        const key = `${normalizeName(row.center)}__${normalizeName(row.pharmacy)}`;
         if (!pairSet.has(key)) pairSet.set(key, { center: row.center, pharmacy: row.pharmacy });
       }
       const uniquePairs = Array.from(pairSet.values());
-      const sameStorePairs: typeof uniquePairs = [];
-      const apiPairs: typeof uniquePairs = [];
-      for (const pair of uniquePairs) {
-        if (normalizeName(pair.center) === normalizeName(pair.pharmacy)) sameStorePairs.push(pair);
-        else apiPairs.push(pair);
-      }
-      const distanceCache = new Map<string, DistanceApiResult>();
-      for (const pair of sameStorePairs) {
-        const key = `${normalizeName(pair.center)}||${normalizeName(pair.pharmacy)}`;
-        distanceCache.set(key, { center: pair.center, pharmacy: pair.pharmacy, distanceKm: 0 });
-      }
-      if (apiPairs.length > 0) {
+
+      // 2. Call API for each pair (with cache + concurrency limit of 5)
+      const distanceCache = new Map<string, DistanceApiResponse>();
+
+      const tasks = uniquePairs.map((pair) => async () => {
         const response = await fetch("/api/distance", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pairs: apiPairs }),
+          body: JSON.stringify({ centerName: pair.center, pharmacyName: pair.pharmacy }),
         });
-        if (!response.ok) {
-          const errBody = await response.json().catch(() => ({}));
-          throw new Error((errBody as { error?: string }).error ?? `API 錯誤 ${response.status}`);
-        }
-        const data: { results: DistanceApiResult[] } = await response.json();
-        for (const result of data.results) {
-          const key = `${normalizeName(result.center)}||${normalizeName(result.pharmacy)}`;
-          distanceCache.set(key, result);
-        }
-      }
-      const failedPairs = Array.from(distanceCache.values()).filter((r) => r.distanceKm === null);
+        const result: DistanceApiResponse = await response.json();
+        const key = `${normalizeName(pair.center)}__${normalizeName(pair.pharmacy)}`;
+        distanceCache.set(key, result);
+      });
+
+      await runWithConcurrency(tasks, 5);
+
+      // 3. Check for failures
+      const failedPairs = Array.from(distanceCache.values()).filter(
+        (r) => r.status === "place_not_found" || r.status === "distance_failed",
+      );
       if (failedPairs.length > 0) {
-        setDistanceError(`部分距離計算失敗（${failedPairs.length} 組），請檢查門市名稱。失敗的距離以 0 公里計算。`);
+        setDistanceError(`部分距離計算失敗（${failedPairs.length} 組），請檢查門市名稱。失敗的距離分以 0 計算。`);
       }
+
+      // 4. Build weighted summaries
       const weighted: WeightedPharmacySummary[] = summaries.map((summary) => {
         const details: DistanceResult[] = [];
         for (const row of summary.rows) {
-          const isSameStore = normalizeName(row.center) === normalizeName(row.pharmacy);
-          const cacheKey = `${normalizeName(row.center)}||${normalizeName(row.pharmacy)}`;
+          const cacheKey = `${normalizeName(row.center)}__${normalizeName(row.pharmacy)}`;
           const cached = distanceCache.get(cacheKey);
+          const isSameStore = cached?.isSameStore ?? (normalizeName(row.center) === normalizeName(row.pharmacy));
           const distanceKm = cached?.distanceKm ?? 0;
-          const distanceScore = getDistanceScore(distanceKm, isSameStore);
+          const distanceScore = cached?.distanceScore ?? 0;
           details.push({ center: row.center, pharmacy: row.pharmacy, distanceKm, distanceScore, isSameStore });
         }
         const distanceScoreTotal = details.reduce((sum, d) => sum + d.distanceScore, 0);
