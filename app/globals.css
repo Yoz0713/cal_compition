@@ -88,7 +88,7 @@ h1 {
   line-height: 1.65;
 }
 
-.guide-grid li + li {
+.guide-grid li+li {
   margin-top: 4px;
 }
 
@@ -299,6 +299,32 @@ select {
 .conflict-cell {
   color: var(--danger);
   font-weight: 700;
+}
+
+/* ─── V2: Export button ────────────────────────────────────────────── */
+
+.export-panel {
+  display: flex;
+  justify-content: center;
+  position: fixed;
+  right: 2vw;
+  bottom: 5vh;
+}
+
+.btn-export {
+  padding: 14px 36px;
+  color: white;
+  background: #1d7a4e;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.btn-export:hover {
+  background: #156139;
 }
 
 /* ─── V2: Distance action area ─────────────────────────────────────── */

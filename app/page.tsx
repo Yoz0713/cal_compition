@@ -14,6 +14,7 @@ import {
   WeightedPharmacySummary,
 } from "../lib/referrals";
 import { paginate } from "../lib/paginate";
+import { exportWeightedExcel } from "../lib/exportExcel";
 
 type UploadStats = {
   totalRows: number;
@@ -398,7 +399,7 @@ export default function Home() {
               <thead>
                 <tr>
                   <th>藥局名稱</th><th>參賽區域</th><th>轉介筆數</th><th>0分</th><th>3分</th><th>10分</th>
-                  <th>聽損總分</th><th>平均分</th>
+                  <th>聽損總分</th>
                 </tr>
               </thead>
               <tbody>
@@ -409,7 +410,6 @@ export default function Home() {
                     <td>{s.referralCount}</td>
                     <td>{s.hearingBonus0Count}</td><td>{s.hearingBonus3Count}</td>
                     <td>{s.hearingBonus10Count}</td><td>{s.hearingScoreTotal}</td>
-                    <td>{s.avgScore.toFixed(1)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -503,6 +503,18 @@ export default function Home() {
               <Pagination current={paginatedRanks.currentPage} total={paginatedRanks.totalPages} totalItems={paginatedRanks.totalItems} pageSize={rankPageSize} onPageChange={setRankPage} onPageSizeChange={(s) => { setRankPageSize(s); setRankPage(1); }} />
             </>
           )}
+        </section>
+      ) : null}
+
+      {/* ─── Export button ──────────────────────────────────────── */}
+      {weightedResults ? (
+        <section className="panel export-panel">
+          <button
+            className="btn-export"
+            onClick={() => exportWeightedExcel(weightedResults, allDistanceDetails, rows)}
+          >
+            匯出 Excel 報表
+          </button>
         </section>
       ) : null}
     </main>
