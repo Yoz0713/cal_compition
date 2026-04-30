@@ -2,18 +2,20 @@ import { NextRequest, NextResponse } from "next/server";
 
 type DistanceRequest = {
   centerName: string;
+  centerAddress: string;
   pharmacyName: string;
+  pharmacyAddress: string;
 };
 
 type DistanceResponse = {
   centerName: string;
+  centerAddress: string;
   pharmacyName: string;
-  centerResolvedAddress?: string;
-  pharmacyResolvedAddress?: string;
+  pharmacyAddress: string;
   distanceKm?: number;
   distanceScore: number;
   isSameStore: boolean;
-  status: "success" | "same_store" | "place_not_found" | "distance_failed";
+  status: "success" | "same_store" | "address_missing" | "distance_failed";
   errorMessage?: string;
 };
 
@@ -30,28 +32,19 @@ function getDistanceScore(distanceKm: number, isSameStore: boolean): number {
   return 5;
 }
 
-async function geocode(
-  address: string,
-  apiKey: string,
-): Promise<{ lat: number; lng: number; resolvedAddress: string } | null> {
-  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
-  url.searchParams.set("address", `大樹藥局${address}`);
-  url.searchParams.set("language", "zh-TW");
-  url.searchParams.set("region", "tw");
-  url.searchParams.set("key", apiKey);
-
-  const response = await fetch(url.toString());
-  const data = await response.json();
-
-  if (data.status !== "OK" || !data.results?.[0]) {
-    return null;
-  }
-
-  const result = data.results[0];
+function createAddressMissingResponse(
+  body: DistanceRequest,
+): DistanceResponse {
   return {
-    lat: result.geometry.location.lat,
-    lng: result.geometry.location.lng,
-    resolvedAddress: result.formatted_address,
+    centerName: body.centerName,
+    centerAddress: body.centerAddress,
+    pharmacyName: body.pharmacyName,
+    pharmacyAddress: body.pharmacyAddress,
+    distanceKm: 0,
+    distanceScore: 0,
+    isSameStore: false,
+    status: "address_missing",
+    errorMessage: "地址對應表找不到此門市地址，請回 Excel 補上",
   };
 }
 
@@ -79,13 +72,14 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "請求格式錯誤" }, { status: 400 });
   }
 
-  const { centerName, pharmacyName } = body;
+  const { centerName, centerAddress, pharmacyName, pharmacyAddress } = body;
 
-  // 1. Same-store check
   if (normalizeName(centerName) === normalizeName(pharmacyName)) {
     const result: DistanceResponse = {
       centerName,
+      centerAddress,
       pharmacyName,
+      pharmacyAddress,
       distanceKm: 0,
       distanceScore: 0.5,
       isSameStore: true,
@@ -94,32 +88,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(result);
   }
 
+  if (!centerAddress || !pharmacyAddress) {
+    return NextResponse.json(createAddressMissingResponse(body));
+  }
+
   try {
-    // 2. Geocoding
-    const [centerGeo, pharmacyGeo] = await Promise.all([
-      geocode(centerName, apiKey),
-      geocode(pharmacyName, apiKey),
-    ]);
-
-    if (!centerGeo || !pharmacyGeo) {
-      const missing: string[] = [];
-      if (!centerGeo) missing.push(`聽力中心「${centerName}」`);
-      if (!pharmacyGeo) missing.push(`藥局「${pharmacyName}」`);
-
-      const result: DistanceResponse = {
-        centerName,
-        pharmacyName,
-        centerResolvedAddress: centerGeo?.resolvedAddress,
-        pharmacyResolvedAddress: pharmacyGeo?.resolvedAddress,
-        distanceScore: 0,
-        isSameStore: false,
-        status: "place_not_found",
-        errorMessage: `查無地點：${missing.join("、")}`,
-      };
-      return NextResponse.json(result);
-    }
-
-    // 3. Routes API
     const routeResponse = await fetch(
       "https://routes.googleapis.com/directions/v2:computeRoutes",
       {
@@ -131,17 +104,14 @@ export async function POST(request: NextRequest) {
         },
         body: JSON.stringify({
           origin: {
-            location: {
-              latLng: { latitude: centerGeo.lat, longitude: centerGeo.lng },
-            },
+            address: centerAddress,
           },
           destination: {
-            location: {
-              latLng: { latitude: pharmacyGeo.lat, longitude: pharmacyGeo.lng },
-            },
+            address: pharmacyAddress,
           },
           travelMode: "DRIVE",
           languageCode: "zh-TW",
+          regionCode: "TW",
         }),
       },
     );
@@ -154,9 +124,10 @@ export async function POST(request: NextRequest) {
 
       const result: DistanceResponse = {
         centerName,
+        centerAddress,
         pharmacyName,
-        centerResolvedAddress: centerGeo.resolvedAddress,
-        pharmacyResolvedAddress: pharmacyGeo.resolvedAddress,
+        pharmacyAddress,
+        distanceKm: 0,
         distanceScore: 0,
         isSameStore: false,
         status: "distance_failed",
@@ -171,9 +142,10 @@ export async function POST(request: NextRequest) {
     if (distanceMeters == null) {
       const result: DistanceResponse = {
         centerName,
+        centerAddress,
         pharmacyName,
-        centerResolvedAddress: centerGeo.resolvedAddress,
-        pharmacyResolvedAddress: pharmacyGeo.resolvedAddress,
+        pharmacyAddress,
+        distanceKm: 0,
         distanceScore: 0,
         isSameStore: false,
         status: "distance_failed",
@@ -187,9 +159,9 @@ export async function POST(request: NextRequest) {
 
     const result: DistanceResponse = {
       centerName,
+      centerAddress,
       pharmacyName,
-      centerResolvedAddress: centerGeo.resolvedAddress,
-      pharmacyResolvedAddress: pharmacyGeo.resolvedAddress,
+      pharmacyAddress,
       distanceKm,
       distanceScore,
       isSameStore: false,
@@ -199,14 +171,17 @@ export async function POST(request: NextRequest) {
   } catch (fetchError) {
     const result: DistanceResponse = {
       centerName,
+      centerAddress,
       pharmacyName,
+      pharmacyAddress,
+      distanceKm: 0,
       distanceScore: 0,
       isSameStore: false,
       status: "distance_failed",
       errorMessage:
         fetchError instanceof Error
           ? fetchError.message
-          : "Google API 查詢失敗",
+          : "Google Routes API 查詢失敗",
     };
     return NextResponse.json(result);
   }

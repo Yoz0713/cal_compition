@@ -22,11 +22,22 @@ export type PharmacySummary = {
   rows: ReferralRow[];
 };
 
+export type StoreAddressMap = Record<string, string>;
+
+export type AddressConflict = {
+  storeName: string;
+  addresses: string[];
+};
+
 export const VALID_REGIONS = ["桃區", "竹苗區", "宜花區", "中彰投區"] as const;
 
 export type ParsedExcelResult = {
   rows: ReferralRow[];
   invalidRows: ReferralRow[];
+  addressMap: StoreAddressMap;
+  addressConflicts: AddressConflict[];
+  addressRowCount: number;
+  hasAddressSheet: boolean;
 };
 
 const EXCEL_TYPES = [
@@ -66,13 +77,15 @@ export async function parseExcel(file: File): Promise<ParsedExcelResult> {
     throw new Error("檔案不是 Excel，請上傳 .xlsx、.xls 或 .xlsm 檔。");
   }
 
-  const rawRows = await readFirstSheetRows(file);
+  const workbook = await readWorkbook(file);
+  const rawRows = readFirstSheetRows(workbook);
+  const addressSheetRows = readAddressSheetRows(workbook);
 
   if (rawRows.length <= 1) {
     throw new Error("Excel 沒有可解析的資料列。");
   }
 
-  return rawRows.slice(1).reduce<ParsedExcelResult>((result, row) => {
+  const parsedResult = rawRows.slice(1).reduce<ParsedExcelResult>((result, row) => {
     const center = String(row[0] ?? "").trim();
     const pharmacy = String(row[1] ?? "").trim();
 
@@ -109,12 +122,36 @@ export async function parseExcel(file: File): Promise<ParsedExcelResult> {
     });
 
     return result;
-  }, { rows: [], invalidRows: [] });
+  }, {
+    rows: [],
+    invalidRows: [],
+    addressMap: {},
+    addressConflicts: [],
+    addressRowCount: 0,
+    hasAddressSheet: addressSheetRows != null,
+  });
+
+  if (addressSheetRows) {
+    const addressResult = buildAddressMap(addressSheetRows);
+    parsedResult.addressMap = addressResult.addressMap;
+    parsedResult.addressConflicts = addressResult.addressConflicts;
+    parsedResult.addressRowCount = addressResult.addressRowCount;
+  }
+
+  return parsedResult;
 }
 
 export async function getExcelDataRowCount(file: File): Promise<number> {
-  const rawRows = await readFirstSheetRows(file);
+  const workbook = await readWorkbook(file);
+  const rawRows = readFirstSheetRows(workbook);
   return Math.max(rawRows.length - 1, 0);
+}
+
+export function getStoreAddress(
+  addressMap: StoreAddressMap,
+  storeName: string,
+): string {
+  return addressMap[normalizeName(storeName)] ?? "";
 }
 
 export function groupByPharmacy(rows: ReferralRow[]): PharmacySummary[] {
@@ -174,9 +211,12 @@ export function groupByPharmacy(rows: ReferralRow[]): PharmacySummary[] {
   );
 }
 
-async function readFirstSheetRows(file: File): Promise<unknown[][]> {
+async function readWorkbook(file: File): Promise<XLSX.WorkBook> {
   const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: "array" });
+  return XLSX.read(buffer, { type: "array" });
+}
+
+function readFirstSheetRows(workbook: XLSX.WorkBook): unknown[][] {
   const firstSheetName = workbook.SheetNames[0];
 
   if (!firstSheetName) {
@@ -192,11 +232,68 @@ async function readFirstSheetRows(file: File): Promise<unknown[][]> {
   );
 }
 
+function readAddressSheetRows(workbook: XLSX.WorkBook): unknown[][] | null {
+  const addressSheetName = workbook.SheetNames.find(
+    (sheetName) => sheetName.trim() === "地址對應表",
+  );
+
+  if (!addressSheetName) return null;
+
+  return XLSX.utils.sheet_to_json<unknown[]>(
+    workbook.Sheets[addressSheetName],
+    {
+      header: 1,
+      blankrows: false,
+    },
+  );
+}
+
+function buildAddressMap(rows: unknown[][]): {
+  addressMap: StoreAddressMap;
+  addressConflicts: AddressConflict[];
+  addressRowCount: number;
+} {
+  const addressMap: StoreAddressMap = {};
+  const displayNames = new Map<string, string>();
+  const addressSets = new Map<string, Set<string>>();
+  let addressRowCount = 0;
+
+  rows.slice(1).forEach((row) => {
+    const storeName = String(row[0] ?? "").trim();
+    const address = String(row[1] ?? "").trim();
+
+    if (!storeName || !address) return;
+
+    const key = normalizeName(storeName);
+    addressRowCount += 1;
+
+    if (!displayNames.has(key)) displayNames.set(key, storeName);
+    if (!addressSets.has(key)) addressSets.set(key, new Set());
+    addressSets.get(key)!.add(address);
+
+    if (!addressMap[key]) addressMap[key] = address;
+  });
+
+  const addressConflicts: AddressConflict[] = [];
+  for (const [key, addresses] of addressSets) {
+    if (addresses.size > 1) {
+      addressConflicts.push({
+        storeName: displayNames.get(key) ?? key,
+        addresses: Array.from(addresses),
+      });
+    }
+  }
+
+  return { addressMap, addressConflicts, addressRowCount };
+}
+
 // ─── V2: Distance scoring ───────────────────────────────────────────
 
 export type DistanceResult = {
   center: string;
+  centerAddress: string;
   pharmacy: string;
+  pharmacyAddress: string;
   distanceKm: number;
   distanceScore: number;
   isSameStore: boolean;

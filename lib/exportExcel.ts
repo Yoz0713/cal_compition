@@ -1,17 +1,30 @@
 import * as XLSX from "xlsx";
-import type { WeightedPharmacySummary, DistanceResult } from "./referrals";
-import { VALID_REGIONS } from "./referrals";
+import type { StoreAddressMap, WeightedPharmacySummary } from "./referrals";
+import { getStoreAddress, VALID_REGIONS } from "./referrals";
+
+export type ExportVerificationItem = {
+  center: string;
+  centerAddress: string;
+  pharmacy: string;
+  distanceKm: number;
+  distanceScore: number;
+  isSameStore: boolean;
+  status: "success" | "same_store" | "address_missing" | "distance_failed";
+  errorMessage: string;
+  pharmacyAddress: string;
+};
 
 /**
  * Build and download an Excel workbook with:
  *   - Dynamic region ranking sheets (only regions with data)
- *   - Google API 核對結果 sheet
+ *   - 距離計算核對結果 sheet
  *   - 原始明細資料 sheet
  */
 export function exportWeightedExcel(
   weightedResults: WeightedPharmacySummary[],
-  allDetails: DistanceResult[],
+  allDetails: ExportVerificationItem[],
   rows: { center: string; pharmacy: string; leftEar: number; rightEar: number; hearingScore: number; region: string }[],
+  addressMap: StoreAddressMap,
 ) {
   const wb = XLSX.utils.book_new();
 
@@ -82,38 +95,56 @@ export function exportWeightedExcel(
     XLSX.utils.book_append_sheet(wb, ws, region);
   }
 
-  // ─── 2. Google API 核對結果 ──────────────────────────────────────
+  // ─── 2. 距離計算核對結果 ────────────────────────────────────────
 
   const apiSheetData = [
-    ["#", "聽力中心", "轉介藥局", "距離(km)", "距離分", "同店"],
-    ...allDetails.map((d, i) => [
-      i + 1,
+    [
+      "聽力中心門市",
+      "聽力中心地址",
+      "藥局門市",
+      "藥局地址",
+      "距離 km",
+      "距離分",
+      "是否同店",
+      "狀態",
+      "錯誤原因",
+    ],
+    ...allDetails.map((d) => [
       d.center,
+      d.centerAddress || "—",
       d.pharmacy,
-      Number(d.distanceKm.toFixed(1)),
+      d.pharmacyAddress || "—",
+      d.status === "address_missing" || d.status === "distance_failed" ? "—" : Number(d.distanceKm.toFixed(1)),
       d.distanceScore,
       d.isSameStore ? "是" : "否",
+      formatDistanceStatus(d.status),
+      d.errorMessage || "—",
     ]),
   ];
 
   const apiWs = XLSX.utils.aoa_to_sheet(apiSheetData);
   apiWs["!cols"] = [
-    { wch: 6 },
-    { wch: 24 },
-    { wch: 24 },
-    { wch: 12 },
-    { wch: 8 },
-    { wch: 6 },
+    { wch: 22 }, // 聽力中心門市
+    { wch: 40 }, // 聽力中心地址
+    { wch: 22 }, // 藥局門市
+    { wch: 40 }, // 藥局地址
+    { wch: 12 }, // 距離 km
+    { wch: 8 },  // 距離分
+    { wch: 10 }, // 是否同店
+    { wch: 14 }, // 狀態
+    { wch: 30 }, // 錯誤原因
   ];
-  XLSX.utils.book_append_sheet(wb, apiWs, "Google API 核對結果");
+  XLSX.utils.book_append_sheet(wb, apiWs, "距離計算核對結果");
 
   // ─── 3. 原始明細資料 ────────────────────────────────────────────
 
   const rawSheetData = [
-    ["聽力中心", "轉介藥局", "左耳聽損", "右耳聽損", "聽損分數", "參賽區域"],
+    ["聽力中心", "聽力中心地址", "轉介藥局", "藥局地址", "左耳聽損", "右耳聽損", "聽損分數", "參賽區域"],
     ...rows.map((r) => [
       r.center,
+      getStoreAddress(addressMap, r.center) || "—",
       r.pharmacy,
+      getStoreAddress(addressMap, r.pharmacy) || "—",
       r.leftEar,
       r.rightEar,
       r.hearingScore,
@@ -124,7 +155,9 @@ export function exportWeightedExcel(
   const rawWs = XLSX.utils.aoa_to_sheet(rawSheetData);
   rawWs["!cols"] = [
     { wch: 24 },
+    { wch: 40 },
     { wch: 24 },
+    { wch: 40 },
     { wch: 10 },
     { wch: 10 },
     { wch: 10 },
@@ -137,4 +170,11 @@ export function exportWeightedExcel(
   const now = new Date();
   const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
   XLSX.writeFile(wb, `轉介競賽報表_${dateStr}.xlsx`);
+}
+
+function formatDistanceStatus(status: ExportVerificationItem["status"]) {
+  if (status === "success") return "成功";
+  if (status === "same_store") return "同店";
+  if (status === "address_missing") return "地址缺失";
+  return "距離計算失敗";
 }

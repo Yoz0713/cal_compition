@@ -2,14 +2,17 @@
 
 import { ChangeEvent, useMemo, useState } from "react";
 import {
+  AddressConflict,
   DistanceResult,
   getExcelDataRowCount,
+  getStoreAddress,
   groupByPharmacy,
   isExcelFile,
   normalizeName,
   parseExcel,
   PharmacySummary,
   ReferralRow,
+  StoreAddressMap,
   VALID_REGIONS,
   WeightedPharmacySummary,
 } from "../lib/referrals";
@@ -26,14 +29,33 @@ type UploadStats = {
 
 type DistanceApiResponse = {
   centerName: string;
+  centerAddress: string;
   pharmacyName: string;
-  centerResolvedAddress?: string;
-  pharmacyResolvedAddress?: string;
+  pharmacyAddress: string;
   distanceKm?: number;
   distanceScore: number;
   isSameStore: boolean;
-  status: "success" | "same_store" | "place_not_found" | "distance_failed";
+  status: "success" | "same_store" | "address_missing" | "distance_failed";
   errorMessage?: string;
+};
+
+export type DistanceVerificationItem = {
+  center: string;
+  centerAddress: string;
+  pharmacy: string;
+  pharmacyAddress: string;
+  distanceKm: number;
+  distanceScore: number;
+  isSameStore: boolean;
+  status: "success" | "same_store" | "address_missing" | "distance_failed";
+  errorMessage: string;
+};
+
+type DistancePair = {
+  center: string;
+  centerAddress: string;
+  pharmacy: string;
+  pharmacyAddress: string;
 };
 
 // Concurrency limiter: run async tasks with max N in parallel
@@ -69,6 +91,10 @@ export default function Home() {
   const [rows, setRows] = useState<ReferralRow[]>([]);
   const [invalidRows, setInvalidRows] = useState<ReferralRow[]>([]);
   const [summaries, setSummaries] = useState<PharmacySummary[]>([]);
+  const [addressMap, setAddressMap] = useState<StoreAddressMap>({});
+  const [addressConflicts, setAddressConflicts] = useState<AddressConflict[]>([]);
+  const [addressRowCount, setAddressRowCount] = useState(0);
+  const [hasAddressSheet, setHasAddressSheet] = useState(false);
   const [stats, setStats] = useState<UploadStats | null>(null);
   const [error, setError] = useState("");
   const [fileName, setFileName] = useState("");
@@ -77,6 +103,7 @@ export default function Home() {
   const [isCalculating, setIsCalculating] = useState(false);
   const [weightedResults, setWeightedResults] = useState<WeightedPharmacySummary[] | null>(null);
   const [distanceError, setDistanceError] = useState("");
+  const [verificationItems, setVerificationItems] = useState<DistanceVerificationItem[]>([]);
 
   const [detailFilters, setDetailFilters] = useState(DETAIL_FILTER_DEFAULTS);
   const [detailPage, setDetailPage] = useState(1);
@@ -87,6 +114,46 @@ export default function Home() {
   const [rankPageSize, setRankPageSize] = useState(25);
 
   const centerCount = useMemo(() => new Set(rows.map((r) => r.center)).size, [rows]);
+
+  const uniqueDistancePairs = useMemo<DistancePair[]>(() => {
+    const pairSet = new Map<string, DistancePair>();
+
+    for (const row of rows) {
+      const key = `${normalizeName(row.center)}__${normalizeName(row.pharmacy)}`;
+      if (!pairSet.has(key)) {
+        pairSet.set(key, {
+          center: row.center,
+          centerAddress: getStoreAddress(addressMap, row.center),
+          pharmacy: row.pharmacy,
+          pharmacyAddress: getStoreAddress(addressMap, row.pharmacy),
+        });
+      }
+    }
+
+    return Array.from(pairSet.values());
+  }, [rows, addressMap]);
+
+  const addressMissingPairs = useMemo(
+    () =>
+      uniqueDistancePairs.filter(
+        (pair) => !pair.centerAddress || !pair.pharmacyAddress,
+      ),
+    [uniqueDistancePairs],
+  );
+
+  const distanceFailedCount = useMemo(
+    () => verificationItems.filter((item) => item.status === "distance_failed").length,
+    [verificationItems],
+  );
+
+  const failedDistanceItems = useMemo(
+    () =>
+      verificationItems.filter(
+        (item) =>
+          item.status === "address_missing" || item.status === "distance_failed",
+      ),
+    [verificationItems],
+  );
 
   // ─── Region checks ───────────────────────────────────────────────
 
@@ -113,8 +180,10 @@ export default function Home() {
     () =>
       summaries.length > 0 &&
       invalidRows.length === 0 &&
-      conflictPharmacies.length === 0,
-    [summaries, invalidRows, conflictPharmacies],
+      conflictPharmacies.length === 0 &&
+      hasAddressSheet &&
+      addressConflicts.length === 0,
+    [summaries, invalidRows, conflictPharmacies, hasAddressSheet, addressConflicts],
   );
 
   const disableReason = useMemo(() => {
@@ -122,19 +191,16 @@ export default function Home() {
     const reasons: string[] = [];
     if (invalidRows.length > 0) reasons.push(`${invalidRows.length} 筆異常資料`);
     if (conflictPharmacies.length > 0) reasons.push(`${conflictPharmacies.length} 間藥局區域衝突`);
+    if (!hasAddressSheet) reasons.push("缺少地址對應表");
+    if (addressConflicts.length > 0) reasons.push(`${addressConflicts.length} 間門市地址衝突`);
     return reasons.join("、");
-  }, [summaries, invalidRows, conflictPharmacies]);
+  }, [summaries, invalidRows, conflictPharmacies, hasAddressSheet, addressConflicts]);
 
   // ─── Flat distance detail list ───────────────────────────────────
 
   const allDistanceDetails = useMemo(() => {
-    if (!weightedResults) return [];
-    const details: DistanceResult[] = [];
-    for (const w of weightedResults) {
-      for (const d of w.distanceDetails) details.push(d);
-    }
-    return details;
-  }, [weightedResults]);
+    return verificationItems;
+  }, [verificationItems]);
 
   const filteredDetails = useMemo(() => {
     let items = allDistanceDetails;
@@ -182,10 +248,15 @@ export default function Home() {
     setRows([]);
     setInvalidRows([]);
     setSummaries([]);
+    setAddressMap({});
+    setAddressConflicts([]);
+    setAddressRowCount(0);
+    setHasAddressSheet(false);
     setStats(null);
     setFileName(file.name);
     setWeightedResults(null);
     setDistanceError("");
+    setVerificationItems([]);
 
     try {
       if (!isExcelFile(file)) throw new Error("檔案不是 Excel，請上傳 .xlsx、.xls 或 .xlsm 檔。");
@@ -199,6 +270,10 @@ export default function Home() {
       setRows(parsedRows);
       setInvalidRows(parsedResult.invalidRows);
       setSummaries(pharmacySummaries);
+      setAddressMap(parsedResult.addressMap);
+      setAddressConflicts(parsedResult.addressConflicts);
+      setAddressRowCount(parsedResult.addressRowCount);
+      setHasAddressSheet(parsedResult.hasAddressSheet);
       setStats({
         totalRows,
         validRows: parsedRows.length,
@@ -218,25 +293,40 @@ export default function Home() {
     if (!canCalculate) return;
     setIsCalculating(true);
     setDistanceError("");
+    setVerificationItems([]);
     setWeightedResults(null);
 
     try {
-      // 1. Collect unique center-pharmacy pairs
-      const pairSet = new Map<string, { center: string; pharmacy: string }>();
-      for (const row of rows) {
-        const key = `${normalizeName(row.center)}__${normalizeName(row.pharmacy)}`;
-        if (!pairSet.has(key)) pairSet.set(key, { center: row.center, pharmacy: row.pharmacy });
-      }
-      const uniquePairs = Array.from(pairSet.values());
-
-      // 2. Call API for each pair (with cache + concurrency limit of 5)
       const distanceCache = new Map<string, DistanceApiResponse>();
+      const apiPairs = uniqueDistancePairs.filter(
+        (pair) => pair.centerAddress && pair.pharmacyAddress,
+      );
 
-      const tasks = uniquePairs.map((pair) => async () => {
+      for (const pair of addressMissingPairs) {
+        const key = `${normalizeName(pair.center)}__${normalizeName(pair.pharmacy)}`;
+        distanceCache.set(key, {
+          centerName: pair.center,
+          centerAddress: pair.centerAddress,
+          pharmacyName: pair.pharmacy,
+          pharmacyAddress: pair.pharmacyAddress,
+          distanceKm: 0,
+          distanceScore: 0,
+          isSameStore: false,
+          status: "address_missing",
+          errorMessage: "地址對應表找不到此門市地址，請回 Excel 補上",
+        });
+      }
+
+      const tasks = apiPairs.map((pair) => async () => {
         const response = await fetch("/api/distance", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ centerName: pair.center, pharmacyName: pair.pharmacy }),
+          body: JSON.stringify({
+            centerName: pair.center,
+            centerAddress: pair.centerAddress,
+            pharmacyName: pair.pharmacy,
+            pharmacyAddress: pair.pharmacyAddress,
+          }),
         });
         const result: DistanceApiResponse = await response.json();
         const key = `${normalizeName(pair.center)}__${normalizeName(pair.pharmacy)}`;
@@ -245,15 +335,26 @@ export default function Home() {
 
       await runWithConcurrency(tasks, 5);
 
-      // 3. Check for failures
-      const failedPairs = Array.from(distanceCache.values()).filter(
-        (r) => r.status === "place_not_found" || r.status === "distance_failed",
+      const vItems: DistanceVerificationItem[] = Array.from(distanceCache.values()).map((r) => ({
+        center: r.centerName,
+        centerAddress: r.centerAddress,
+        pharmacy: r.pharmacyName,
+        pharmacyAddress: r.pharmacyAddress,
+        distanceKm: r.distanceKm ?? 0,
+        distanceScore: r.distanceScore,
+        isSameStore: r.isSameStore,
+        status: r.status,
+        errorMessage: r.errorMessage ?? "",
+      }));
+      setVerificationItems(vItems);
+
+      const failedPairs = vItems.filter(
+        (v) => v.status === "address_missing" || v.status === "distance_failed",
       );
       if (failedPairs.length > 0) {
-        setDistanceError(`部分距離計算失敗（${failedPairs.length} 組），請檢查門市名稱。失敗的距離分以 0 計算。`);
+        setDistanceError(`部分距離計算未完成（${failedPairs.length} 組），地址缺失或距離失敗的距離分以 0 計算。`);
       }
 
-      // 4. Build weighted summaries
       const weighted: WeightedPharmacySummary[] = summaries.map((summary) => {
         const details: DistanceResult[] = [];
         for (const row of summary.rows) {
@@ -262,7 +363,15 @@ export default function Home() {
           const isSameStore = cached?.isSameStore ?? (normalizeName(row.center) === normalizeName(row.pharmacy));
           const distanceKm = cached?.distanceKm ?? 0;
           const distanceScore = cached?.distanceScore ?? 0;
-          details.push({ center: row.center, pharmacy: row.pharmacy, distanceKm, distanceScore, isSameStore });
+          details.push({
+            center: row.center,
+            centerAddress: cached?.centerAddress ?? getStoreAddress(addressMap, row.center),
+            pharmacy: row.pharmacy,
+            pharmacyAddress: cached?.pharmacyAddress ?? getStoreAddress(addressMap, row.pharmacy),
+            distanceKm,
+            distanceScore,
+            isSameStore,
+          });
         }
         const distanceScoreTotal = details.reduce((sum, d) => sum + d.distanceScore, 0);
         return { ...summary, distanceScoreTotal, weightedTotalScore: summary.hearingScoreTotal + distanceScoreTotal, distanceDetails: details };
@@ -305,7 +414,7 @@ export default function Home() {
           <div>
             <h3>Excel 欄位</h3>
             <ol>
-              <li>第 1 列可放標題，系統從第 2 列開始讀取。</li>
+              <li>Excel 至少需要主資料表與「地址對應表」。</li>
               <li>A 欄為聽力中心，B 欄為轉介藥局。</li>
               <li>C 欄為左耳聽損，D 欄為右耳聽損。</li>
               <li>E 欄為參賽區域（桃區 / 竹苗區 / 宜花區 / 中彰投區）。</li>
@@ -329,11 +438,11 @@ export default function Home() {
             </ol>
           </div>
           <div>
-            <h3>區域規則</h3>
+            <h3>地址規則</h3>
             <ol>
-              <li>參賽區域由 Excel E 欄提供，系統不可手動修改。</li>
-              <li>同一藥局只能有一個參賽區域。</li>
-              <li>若同一藥局出現多區域，視為區域衝突，需回 Excel 修正。</li>
+              <li>地址對應表 A 欄為門市名稱，B 欄為門市地址。</li>
+              <li>距離只使用地址對應表，不使用 Places 或 Geocoding 查店名。</li>
+              <li>同一門市出現多個不同地址時，需回 Excel 修正。</li>
             </ol>
           </div>
         </div>
@@ -367,6 +476,26 @@ export default function Home() {
               {conflictPharmacies.length} 間藥局出現多個參賽區域（區域衝突），請回 Excel 修正後重新上傳。
               衝突藥局：{conflictPharmacies.map((p) => p.name).join("、")}
             </p>
+          ) : null}
+          <div className="step-title address-summary-title"><span>地址對應表</span><h2>地址摘要</h2></div>
+          <div className="stats-grid">
+            <StatCard label="地址對應筆數" value={addressRowCount} />
+            <StatCard label="地址缺失組數" value={addressMissingPairs.length} />
+            <StatCard label="地址衝突門市數" value={addressConflicts.length} />
+            <StatCard label="可計算距離組數" value={uniqueDistancePairs.length - addressMissingPairs.length} />
+            <StatCard label="距離計算失敗組數" value={distanceFailedCount} />
+          </div>
+          {!hasAddressSheet ? (
+            <p className="error">Excel 缺少「地址對應表」工作表，無法進行距離加權計算。</p>
+          ) : null}
+          {addressConflicts.length > 0 ? (
+            <div className="error">
+              {addressConflicts.map((conflict) => (
+                <p key={conflict.storeName}>
+                  地址對應表中門市 {conflict.storeName} 出現多個不同地址，請回 Excel 修正。
+                </p>
+              ))}
+            </div>
           ) : null}
         </section>
       ) : null}
@@ -429,7 +558,7 @@ export default function Home() {
       {/* ─── Step 4: Distance detail list ─────────────────────────── */}
       {weightedResults ? (
         <section className="panel">
-          <div className="step-title"><span>Step 4</span><h2>Google API 查詢結果核對列表</h2></div>
+          <div className="step-title"><span>Step 4</span><h2>距離計算核對列表</h2></div>
           <div className="filter-bar">
             <label className="filter-label">店家搜尋
               <input className="filter-input" type="text" placeholder="輸入聽力中心或藥局名稱" value={detailFilters.keyword} onChange={(e) => updateDetailFilter({ keyword: e.target.value })} />
@@ -443,15 +572,19 @@ export default function Home() {
               <div className="table-wrap">
                 <table>
                   <thead>
-                    <tr><th>#</th><th>聽力中心</th><th>轉介藥局</th><th>距離(km)</th><th>距離分</th><th>同店</th></tr>
+                    <tr><th>#</th><th>聽力中心門市</th><th>聽力中心地址</th><th>藥局門市</th><th>藥局地址</th><th>距離 km</th><th>距離分</th><th>狀態</th><th>錯誤原因</th></tr>
                   </thead>
                   <tbody>
                     {paginatedDetails.items.map((d, i) => (
                       <tr key={`${d.center}-${d.pharmacy}-${i}`}>
                         <td>{(paginatedDetails.currentPage - 1) * paginatedDetails.pageSize + i + 1}</td>
-                        <td>{d.center}</td><td>{d.pharmacy}</td>
+                        <td>{d.center}</td>
+                        <td>{d.centerAddress || "—"}</td>
+                        <td>{d.pharmacy}</td>
+                        <td>{d.pharmacyAddress || "—"}</td>
                         <td>{d.distanceKm.toFixed(1)}</td><td>{d.distanceScore}</td>
-                        <td>{d.isSameStore ? "是" : "否"}</td>
+                        <td>{formatDistanceStatus(d.status)}</td>
+                        <td>{d.errorMessage || "—"}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -460,6 +593,30 @@ export default function Home() {
               <Pagination current={paginatedDetails.currentPage} total={paginatedDetails.totalPages} totalItems={paginatedDetails.totalItems} pageSize={detailPageSize} onPageChange={setDetailPage} onPageSizeChange={(s) => { setDetailPageSize(s); setDetailPage(1); }} />
             </>
           )}
+          {failedDistanceItems.length > 0 ? (
+            <div className="failure-list">
+              <h3>距離失敗清單</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>聽力中心門市</th><th>聽力中心地址</th><th>藥局門市</th><th>藥局地址</th><th>狀態</th><th>錯誤原因</th></tr>
+                  </thead>
+                  <tbody>
+                    {failedDistanceItems.map((item) => (
+                      <tr key={`${item.center}-${item.pharmacy}-${item.status}`}>
+                        <td>{item.center}</td>
+                        <td>{item.centerAddress || "—"}</td>
+                        <td>{item.pharmacy}</td>
+                        <td>{item.pharmacyAddress || "—"}</td>
+                        <td>{formatDistanceStatus(item.status)}</td>
+                        <td>{item.errorMessage || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 
@@ -511,7 +668,7 @@ export default function Home() {
         <section className="panel export-panel">
           <button
             className="btn-export"
-            onClick={() => exportWeightedExcel(weightedResults, allDistanceDetails, rows)}
+            onClick={() => exportWeightedExcel(weightedResults, allDistanceDetails, rows, addressMap)}
           >
             匯出 Excel 報表
           </button>
@@ -528,6 +685,13 @@ function StatCard({ label, value }: { label: string; value: number }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function formatDistanceStatus(status: DistanceVerificationItem["status"]) {
+  if (status === "success") return "成功";
+  if (status === "same_store") return "同店";
+  if (status === "address_missing") return "地址缺失";
+  return "距離計算失敗";
 }
 
 function Pagination({
